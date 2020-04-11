@@ -16,6 +16,11 @@ import sublime_plugin
 import sys
 import threading
 import timeit
+import unicodedata #added by JN
+import math #added by JN
+
+gFileList = {}
+gResults = {}
 
 class Settings():
 	def __init__(self, view, args):
@@ -44,12 +49,17 @@ class Engine():
 		match_files = [fnmatch.translate(p) for p in patt_files]
 		match_folders = [fnmatch.translate(p) for p in patt_folders]
 
-		self.patterns = re.compile(match_patterns, case)
+		self.resolve_symlinks = settings.get('resolve_symlinks', True)
+		self.patterns = re.compile(match_patterns, case) #'TODO[\\s]*?:[\\s]*(?P<todo>.*)$'
 		self.priority = re.compile(r'\(([0-9]{1,2})\)')
+		self.startdate = re.compile(r'(?<=@start)\(([^]]+\-[^]]+\-[^]]+)\)') #added by JN
 		self.exclude_files = [re.compile(p) for p in match_files]
 		self.exclude_folders = [re.compile(p) for p in match_folders]
 		self.open = self.view.window().views()
 		self.open_files = [v.file_name() for v in self.open if v.file_name()]
+
+		self.depth = settings.get('render_folder_depth', 1)
+		self.renderIncludeFolder = settings.get('render_include_folder', False)
 
 	def files(self):
 		seen_paths = []
@@ -72,51 +82,138 @@ class Engine():
 			yield p
 
 	def extract(self, files):
+		self.prioritysomeday = int(settings.get('priority_from_which_its_someday', 80))
 		encoding = settings.get('encoding', 'utf-8')
 		for p in files:
-			try:
-				if p in self.open_files:
-					for view in self.open:
-						if view.file_name() == p:
-							f = []
-							lines = view.lines(sublime.Region(0, view.size()))
-							for line in lines:
-								f.append(view.substr(line))
-							break
-				else:
-					f = io.open(p, 'r', encoding=encoding)
-				for num, line in enumerate(f, 1):
-					for result in self.patterns.finditer(line):
-						for patt, note in result.groupdict().items():
-							if not note and note != '':
-								continue
-							priority_match = self.priority.search(note)
-							if(priority_match):
-								priority = int(priority_match.group(1))
-							else:
-								priority = 50
-							yield {
-								'file': p,
-								'patt': patt,
-								'note': note,
-								'line': num,
-								'priority': priority
-							}
-			except(IOError, UnicodeDecodeError):
-				f = None
-			finally:
-				thread.increment()
-				if f is not None and type(f) is not list:
-					f.close()
+			global gFileList
+			global gResults
+			resultsinfile = []
+			lastSeenChangeDate = gFileList.get(p)
+			changeDate = os.path.getmtime(p)
+			if changeDate == lastSeenChangeDate:
+				#file not changed since last read
+				itemlist = [d for d in gResults if d['file'] == p]
+				for item in itemlist:
+					resultsinfile.append((item['patt'], item['note'], item['line']))
+			else:
+				#file changed since last read
+				gFileList[p] = changeDate
+				try:
+					if p in self.open_files:
+						for view in self.open:
+							if view.file_name() == p:
+								f = []
+								lines = view.lines(sublime.Region(0, view.size()))
+								for line in lines:
+									f.append(view.substr(line))
+								break
+					else:
+						f = io.open(p, 'r', encoding=encoding)
+					for num, line in enumerate(f, 1):
+						for result in self.patterns.finditer(line):
+							#resultsinfile.extend(result.groupdict().items())
+							for item in result.groupdict().items():
+								resultsinfile.append((item[0], item[1], num))
+				except(IOError, UnicodeDecodeError):
+					f = None
+				finally:
+					if f is not None and type(f) is not list:
+						f.close()
+
+			for patt, note, num in resultsinfile:
+				if not note and note != '':
+					continue
+				priority_match = self.priority.search(note)
+				if(priority_match):	priority = int(priority_match.group(1))
+				else:				priority = 50
+				#added by JN 
+				filename = self.getFileName(p, num)
+				startdate_str = self.getStartdate(note)
+				timeliness = self.getTimeliness(startdate_str)
+				timelinessgroup = self.getTimelinessGroup(priority, startdate_str, timeliness)
+				#end added by JN
+				yield {
+					'file': p,
+					'filename': filename,   #added by JN
+					'patt': patt,
+					'note': note,
+					'line': num,
+					'priority': priority,
+					'startdate': startdate_str,  #added by JN
+					'timeliness': abs(timeliness),  #added by JN
+					'timelinessgroup': timelinessgroup  #added by JN
+				}
+
+			thread.increment()
+
+
+	def debugStr(self, str):
+		for i in str:
+			if ord(i) < 127:
+				chartype =  'ascii'
+			else:
+				chartype = 'multibytes'
+			print(i, ' ', ord(i), chartype)
+
+	def debugStr2(self, str):
+		for i, c in enumerate(str):
+			print(i, '%04x' % ord(c), unicodedata.category(c), end=" ")
+			print(unicodedata.name(c))
 
 	def process(self):
 		return self.extract(self.files())
 
 	def resolve(self, directory):
-		if settings.get('resolve_symlinks', True):
-			return os.path.realpath(os.path.expanduser(os.path.abspath(directory)))
+		if self.resolve_symlinks:	return os.path.realpath(os.path.expanduser(os.path.abspath(directory)))
+		else:						return os.path.expanduser(os.path.abspath(directory))
+
+	#added by JN
+	def getFileName(self, file, line):
+		if self.renderIncludeFolder:
+			if self.depth == 'auto':
+				for folder in sublime.active_window().folders():
+					if file.startswith(folder):
+						file_a = os.path.relpath(file, folder)
+						break
+				file_a = file.replace('\\', '/')
+			else:
+				file_a = os.path.dirname(file).replace('\\', '/').split('/')
+				file_a = '/'.join(file_a[-self.depth:] + [os.path.basename(file)])
 		else:
-			return os.path.expanduser(os.path.abspath(directory))
+			file_a = os.path.basename(file)
+		file_a = unicodedata.normalize('NFC', file_a) #very important - otherwise strage effects with ü which an also be encoded as u¨ - the two dots being chr(776)
+		return '%f:%l' \
+			.replace('%f', file_a) \
+			.replace('%l', str(line))
+
+	def getStartdate(self, note):
+		startdate_match = self.startdate.search(note)
+		if(startdate_match):
+			startdate_str = str(startdate_match.group(1))
+		else:
+			startdate_str = ""
+		return startdate_str
+
+	def getTimeliness(self, startdate_str):
+		if startdate_str != '':
+			startdate = datetime.date(int(startdate_str[0:4]),int(startdate_str[5:7]),int(startdate_str[8:10]))
+			today = datetime.date.today()
+			delta = today - startdate
+			timeliness = delta.days
+		else:
+			timeliness = 99
+		return timeliness
+
+	def getTimelinessGroup(self, priority, startdate_str, timeliness):
+		if startdate_str == '':
+			prio_someday = range(self.prioritysomeday, 100)
+			if priority in prio_someday:	timelinessgroup = 'Someday'
+			else:							timelinessgroup = 'Important'
+		else:
+			if timeliness < 0:				timelinessgroup = 'Future'
+			else:							timelinessgroup = 'Now'
+		return timelinessgroup
+	#end added by JN
 
 class Thread(threading.Thread):
 	def __init__(self, engine, callback):
@@ -134,7 +231,7 @@ class Thread(threading.Thread):
 			self.thread()
 
 	def thread(self):
-		results = list(self.engine.process())
+		results = list(self.engine.process()) #function calling yield in extract
 		self.callback(results, self.finish(), self.i)
 
 	def finish(self):
@@ -188,10 +285,12 @@ class TodoReviewCommand(sublime_plugin.TextCommand):
 
 class TodoReviewRender(sublime_plugin.TextCommand):
 	def run(self, edit, results, time, count, args):
+		global gResults
 		self.args = args
 		self.edit = edit
 		self.time = time
 		self.count = count
+		gResults = results
 		self.results = results
 		self.sorted = self.sort()
 		self.rview = self.get_view()
@@ -204,12 +303,23 @@ class TodoReviewRender(sublime_plugin.TextCommand):
 	def sort(self):
 		self.largest = 0
 		for item in self.results:
-			self.largest = max(len(self.draw_file(item)), self.largest)
+			self.largest = max(len(item['filename']), self.largest)
 		self.largest = min(self.largest, settings.get('render_maxspaces', 50)) + 6
-		w = settings.get('patterns_weight', {})
-		key = lambda m: (str(w.get(m['patt'].upper(), m['patt'])), m['priority'])
+
+		sortingTimeliness = {}
+		sortingTimeliness['Now'] = 1
+		sortingTimeliness['Important'] = 2
+		sortingTimeliness['Someday'] = 3
+		sortingTimeliness['Future'] = 4
+		sortingPattern = settings.get('patterns_weight', {})
+
+		self.showtimelinessfirst = settings.get('show_timeliness_first', True)
+		if self.showtimelinessfirst:
+			key = lambda m: (str(sortingTimeliness.get(m['timelinessgroup'], 9)), str(sortingPattern.get(m['patt'].upper(), m['patt'])), m['timeliness'], m['priority']) #changed by JN
+		else:
+			key = lambda m: (str(sortingPattern.get(m['patt'].upper(), m['patt'])), str(sortingTimeliness.get(m['timelinessgroup'], 9)), m['timeliness'], m['priority']) #changed by JN
 		results = sorted(self.results, key=key)
-		return itertools.groupby(results, key=lambda m: m['patt'])
+		return results
 
 	def get_view(self):
 		self.window = sublime.active_window()
@@ -249,49 +359,85 @@ class TodoReviewRender(sublime_plugin.TextCommand):
 		res += '\n'
 		self.rview.insert(self.edit, self.rview.size(), res)
 
+	#changes by JN
 	def draw_results(self):
 		data = [x[:] for x in [[]] * 2]
-		for patt, items in self.sorted:
-			items = list(items)
-			res = '\n## %t (%n)\n' \
-				.replace('%t', patt.upper()) \
-				.replace('%n', str(len(items)))
-			self.rview.insert(self.edit, self.rview.size(), res)
-			for idx, item in enumerate(items, 1):
-				line = '%i. %f' \
-					.replace('%i', str(idx)) \
-					.replace('%f', self.draw_file(item))
-				res = '%f%s%n\n' \
-					.replace('%f', line) \
-					.replace('%s', ' '*max((self.largest - len(line)), 1)) \
-					.replace('%n', item['note'])
-				start = self.rview.size()
-				self.rview.insert(self.edit, start, res)
-				region = sublime.Region(start, self.rview.size())
-				data[0].append(region)
-				data[1].append(item)
+		if self.showtimelinessfirst:
+			keyfunc_01 = lambda m: m['timelinessgroup']
+			keyfunc_02 = lambda m: m['patt']
+		else:
+			keyfunc_01 = lambda m: m['patt']
+			keyfunc_02 = lambda m: m['timelinessgroup']
+
+		self.setPaddingLenNumber(keyfunc_01, keyfunc_02)
+		self.setShowGroupHeading(keyfunc_01, keyfunc_02)
+		for key_01, items_01 in itertools.groupby(self.sorted, key=keyfunc_01):
+			groupList_01 = list(items_01)
+			if self.showgroupheading_01:
+				res = '\n## %t (%n)\n' \
+					.replace('%t', key_01.upper()) \
+					.replace('%n', str(len(groupList_01)))
+				self.rview.insert(self.edit, self.rview.size(), res)
+
+			for key_02, items_02 in itertools.groupby(groupList_01, key=keyfunc_02):
+				groupList_02 = list(items_02)
+				if self.showgroupheading_02:
+					res = '### %t (%n)\n' \
+						.replace('%t', key_02.upper()) \
+						.replace('%n', str(len(groupList_02)))
+					self.rview.insert(self.edit, self.rview.size(), res)
+				self.draw_results_add_items(data, groupList_02)
+		
 		self.rview.add_regions('results', data[0], '')
 		d = dict(('{0},{1}'.format(k.a, k.b), v) for k, v in zip(data[0], data[1]))
 		self.rview.settings().set('review_results', d)
 
+	def draw_results_add_items(self, data, itemsList):
+		for idx, item in enumerate(itemsList, 1):
+			res = '%i %f%n\n' \
+				.replace('%i', str(idx).rjust(self.paddinglennr)) \
+				.replace('%f', self.draw_file(item).ljust(self.largest)) \
+				.replace('%n', item['note'])
+			start = self.rview.size()
+			self.rview.insert(self.edit, start, res)
+			region = sublime.Region(start, self.rview.size())
+			data[0].append(region)
+			data[1].append(item)
+
 	def draw_file(self, item):
-		if settings.get('render_include_folder', False):
-			depth = settings.get('render_folder_depth', 1)
-			if depth == 'auto':
-				f = item['file']
-				for folder in sublime.active_window().folders():
-					if f.startswith(folder):
-						f = os.path.relpath(f, folder)
-						break
-				f = f.replace('\\', '/')
-			else:
-				f = os.path.dirname(item['file']).replace('\\', '/').split('/')
-				f = '/'.join(f[-depth:] + [os.path.basename(item['file'])])
-		else:
-			f = os.path.basename(item['file'])
-		return '%f:%l' \
-			.replace('%f', f) \
-			.replace('%l', str(item['line']))
+		filename = item['filename']
+		namelength =  len(filename)
+		overlength = namelength - self.largest
+		if overlength >= 0:
+			filename_splitted = filename.split(':')
+			filename = filename_splitted[0]
+			newnamelength = namelength - overlength - 4 - len(filename_splitted[1])
+			filename = filename[0:newnamelength] + '..:' + filename_splitted[1]
+		return filename
+
+	def setPaddingLenNumber(self, keyfunc_01, keyfunc_02):
+		maxLenList = 0
+		for key_01, items_01 in itertools.groupby(self.sorted, key=keyfunc_01):
+			groupList_01 = list(items_01)
+			for key_02, items_02 in itertools.groupby(groupList_01, key=keyfunc_02):
+				groupList_02 = list(items_02)
+				maxLenList = max(maxLenList, len(groupList_02))
+		maxLenList = max(1, maxLenList)
+		self.paddinglennr = int(math.log10(maxLenList))+1
+
+	def setShowGroupHeading(self, keyfunc_01, keyfunc_02):
+		unique_01 = []
+		unique_02 = []
+		for key_01, items_01 in itertools.groupby(self.sorted, key=keyfunc_01):
+			if key_01 not in unique_01: unique_01.append(key_01)
+			groupList_01 = list(items_01)
+			for key_02, items_02 in itertools.groupby(groupList_01, key=keyfunc_02):
+				if key_02 not in unique_02: unique_02.append(key_02)
+		if len(unique_01) > 1: self.showgroupheading_01 = True 
+		else: self.showgroupheading_01 = False
+		if len(unique_02) > 1: self.showgroupheading_02 = True
+		else: self.showgroupheading_02 = False
+
 
 class TodoReviewResults(sublime_plugin.TextCommand):
 	def run(self, edit, **args):
